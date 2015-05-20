@@ -235,10 +235,8 @@ namespace hpx
 #include <hpx/traits/acquire_future.hpp>
 
 #include <boost/atomic.hpp>
-#include <boost/enable_shared_from_this.hpp>
 #include <boost/fusion/include/for_each.hpp>
 #include <boost/fusion/include/is_sequence.hpp>
-#include <boost/shared_ptr.hpp>
 #include <boost/utility/enable_if.hpp>
 
 #include <algorithm>
@@ -297,12 +295,12 @@ namespace hpx { namespace lcos
     {
         ///////////////////////////////////////////////////////////////////////
         template <typename Sequence>
-        struct when_some;
+        struct when_some_frame;
 
         template <typename Sequence>
         struct set_when_some_callback_impl
         {
-            explicit set_when_some_callback_impl(when_some<Sequence>& when)
+            explicit set_when_some_callback_impl(when_some_frame<Sequence>& when)
               : when_(when), idx_(0)
             {}
 
@@ -319,16 +317,16 @@ namespace hpx { namespace lcos
                             typename lcos::detail::shared_state_ptr_for<Future>::type
                             shared_state_ptr;
 
+                        boost::intrusive_ptr<when_some_frame<Sequence> > that_(&when_);
                         shared_state_ptr const& shared_state =
                             lcos::detail::get_shared_state(future);
-
                         shared_state->execute_deferred();
                         shared_state->set_on_completed(util::bind(
-                            &when_some<Sequence>::on_future_ready, when_.shared_from_this(),
+                            &when_some_frame<Sequence>::on_future_ready, std::move(that_),
                             idx_, threads::get_self_id()));
                     }
                     else {
-                        when_.lazy_values_.indices.push_back(idx_);
+                        when_.t_.indices.push_back(idx_);
                         if (when_.count_.fetch_add(1) + 1 == when_.needed_count_)
                         {
                             when_.goal_reached_on_calling_thread_ = true;
@@ -352,31 +350,46 @@ namespace hpx { namespace lcos
                 std::for_each(sequence.begin(), sequence.end(), *this);
             }
 
-            when_some<Sequence>& when_;
+            when_some_frame<Sequence>& when_;
             mutable std::size_t idx_;
         };
 
         template <typename Sequence>
-        void set_on_completed_callback(when_some<Sequence>& when)
+        void set_on_completed_callback(when_some_frame<Sequence>& when)
         {
             set_when_some_callback_impl<Sequence> callback(when);
-            callback.apply(when.lazy_values_.futures);
+            callback.apply(when.t_.futures);
         }
 
         template <typename Sequence>
-        struct when_some : boost::enable_shared_from_this<when_some<Sequence> > //-V690
+        struct when_some_frame //-V690
+          : hpx::lcos::detail::future_data<when_some_result<Sequence> >
         {
-            typedef lcos::local::spinlock mutex_type;
+            typedef when_some_result<Sequence> result_type;
+            typedef hpx::lcos::future<result_type> type;
+
+        private:
+            // workaround gcc regression wrongly instantiating constructors
+            when_some_frame();
+            when_some_frame(when_some_frame const&);
 
         public:
+            template <typename Tuple_>
+            when_some_frame(Tuple_ && t, std::size_t n)
+              : t_(std::forward<Tuple_>(t))
+              , count_(0)
+              , needed_count_(n)
+              , goal_reached_on_calling_thread_(false)
+            {}
+
             void on_future_ready(std::size_t idx, threads::thread_id_type const& id)
             {
                 std::size_t const new_count = count_.fetch_add(1) + 1;
                 if (new_count <= needed_count_)
                 {
                     {
-                        typename mutex_type::scoped_lock l(this->mtx_);
-                        lazy_values_.indices.push_back(idx);
+                        boost::lock_guard<lcos::local::spinlock> l(this->mtx_);
+                        t_.indices.push_back(idx);
                     }
                     if (new_count == needed_count_) {
                         if (id != threads::get_self_id()) {
@@ -387,22 +400,6 @@ namespace hpx { namespace lcos
                     }
                 }
             }
-
-        private:
-            // workaround gcc regression wrongly instantiating constructors
-            when_some();
-            when_some(when_some const&);
-
-        public:
-            typedef Sequence argument_type;
-            typedef when_some_result<Sequence> result_type;
-
-            when_some(argument_type && lazy_values, std::size_t n)
-              : lazy_values_(std::move(lazy_values))
-              , count_(0)
-              , needed_count_(n)
-              , goal_reached_on_calling_thread_(false)
-            {}
 
             result_type operator()()
             {
@@ -422,11 +419,10 @@ namespace hpx { namespace lcos
                 // at least N futures should be ready
                 HPX_ASSERT(count_.load(boost::memory_order_seq_cst) >= needed_count_);
 
-                return std::move(lazy_values_);
+                return std::move(t_);
             }
 
-            mutable mutex_type mtx_;
-            result_type lazy_values_;
+            result_type t_;
             boost::atomic<std::size_t> count_;
             std::size_t needed_count_;
             bool goal_reached_on_calling_thread_;
@@ -437,20 +433,21 @@ namespace hpx { namespace lcos
     template <typename Future>
     lcos::future<when_some_result<std::vector<Future> > >
     when_some(std::size_t n,
-        std::vector<Future>& lazy_values,
+        std::vector<Future>& values,
         error_code& ec = throws)
     {
         BOOST_STATIC_ASSERT_MSG(
             traits::is_future<Future>::value, "invalid use of when_some");
 
         typedef std::vector<Future> result_type;
+        typedef detail::when_some_frame<result_type> frame_type;
 
         if (n == 0)
         {
-            return lcos::make_ready_future(std::move(lazy_values));
+            return lcos::make_ready_future(std::move(values));
         }
 
-        if (n > lazy_values.size())
+        if (n > values.size())
         {
             HPX_THROWS_IF(ec, hpx::bad_parameter,
                 "hpx::lcos::when_some",
@@ -458,30 +455,26 @@ namespace hpx { namespace lcos
             return lcos::make_ready_future(result_type());
         }
 
-        result_type lazy_values_;
-        lazy_values_.reserve(lazy_values.size());
-        std::transform(lazy_values.begin(), lazy_values.end(),
-            std::back_inserter(lazy_values_),
+        result_type values_;
+        values_.reserve(values.size());
+        std::transform(values.begin(), values.end(),
+            std::back_inserter(values_),
             traits::acquire_future_disp());
 
-        boost::shared_ptr<detail::when_some<result_type> > f =
-            boost::make_shared<detail::when_some<result_type> >(
-                std::move(lazy_values_), n);
+        boost::intrusive_ptr<frame_type> p(new frame_type(std::move(values_), n));
+        p->await();
 
-        lcos::local::futures_factory<when_some_result<result_type>()> p(
-            util::bind(&detail::when_some<result_type>::operator(), f));
-
-        p.apply();
-        return p.get_future();
+        using traits::future_access;
+        return future_access<typename frame_type::type>::create(std::move(p));
     }
 
     template <typename Future>
     lcos::future<when_some_result<std::vector<Future> > > //-V659
     when_some(std::size_t n,
-        std::vector<Future> && lazy_values,
+        std::vector<Future> && values,
         error_code& ec = throws)
     {
-        return lcos::when_some(n, lazy_values, ec);
+        return lcos::when_some(n, values, ec);
     }
 
     template <typename Iterator>
@@ -496,11 +489,11 @@ namespace hpx { namespace lcos
             future_type;
         typedef std::vector<future_type> result_type;
 
-        result_type lazy_values_;
-        std::transform(begin, end, std::back_inserter(lazy_values_),
+        result_type values_;
+        std::transform(begin, end, std::back_inserter(values_),
             traits::acquire_future_disp());
 
-        return lcos::when_some(n, lazy_values_, ec);
+        return lcos::when_some(n, values_, ec);
     }
 
     template <typename Iterator>
@@ -515,14 +508,14 @@ namespace hpx { namespace lcos
             future_type;
         typedef std::vector<future_type> result_type;
 
-        result_type lazy_values_;
-        lazy_values_.reserve(count);
+        result_type values_;
+        values_.reserve(count);
 
         traits::acquire_future_disp func;
         for (std::size_t i = 0; i != count; ++i)
-            lazy_values_.push_back(func(*begin++));
+            values_.push_back(func(*begin++));
 
-        return lcos::when_some(n, lazy_values_, ec);
+        return lcos::when_some(n, values_, ec);
     }
 
     inline lcos::future<when_some_result<hpx::util::tuple<> > >
@@ -530,12 +523,12 @@ namespace hpx { namespace lcos
     {
         typedef hpx::util::tuple<> result_type;
 
-        result_type lazy_values;
+        result_type values;
 
         if (n == 0)
         {
             return lcos::make_ready_future(
-                when_some_result<result_type>(std::move(lazy_values)));
+                when_some_result<result_type>(std::move(values)));
         }
 
         HPX_THROWS_IF(ec, hpx::bad_parameter,
@@ -554,14 +547,15 @@ namespace hpx { namespace lcos
         typedef hpx::util::tuple<
                 typename traits::acquire_future<Ts>::type...
             > result_type;
+        typedef detail::when_some_frame<result_type> frame_type;
 
         traits::acquire_future_disp func;
-        result_type lazy_values(func(std::forward<Ts>(ts))...);
+        result_type values(func(std::forward<Ts>(ts))...);
 
         if (n == 0)
         {
             return lcos::make_ready_future(
-                when_some_result<result_type>(std::move(lazy_values)));
+                when_some_result<result_type>(std::move(values)));
         }
 
         if (n > sizeof...(Ts))
@@ -572,14 +566,11 @@ namespace hpx { namespace lcos
             return lcos::make_ready_future(when_some_result<result_type>());
         }
 
-        boost::shared_ptr<detail::when_some<result_type> > f =
-            boost::make_shared<detail::when_some<result_type> >(
-                std::move(lazy_values), n);
-
+        boost::intrusive_ptr<frame_type> f(new frame_type(std::move(values), n));
         lcos::local::futures_factory<when_some_result<result_type>()> p(
-            util::bind(&detail::when_some<result_type>::operator(), f));
-
+            util::bind(&detail::when_some_frame<result_type>::operator(), f));
         p.apply();
+
         return p.get_future();
     }
 
@@ -592,14 +583,15 @@ namespace hpx { namespace lcos
         typedef hpx::util::tuple<
                 typename traits::acquire_future<Ts>::type...
             > result_type;
+        typedef detail::when_some_frame<result_type> frame_type;
 
         traits::acquire_future_disp func;
-        result_type lazy_values(func(std::forward<Ts>(ts))...);
+        result_type values(func(std::forward<Ts>(ts))...);
 
         if (n == 0)
         {
             return lcos::make_ready_future(
-                when_some_result<result_type>(std::move(lazy_values)));
+                when_some_result<result_type>(std::move(values)));
         }
 
         if (n > sizeof...(Ts))
@@ -610,14 +602,11 @@ namespace hpx { namespace lcos
             return lcos::make_ready_future(when_some_result<result_type>());
         }
 
-        boost::shared_ptr<detail::when_some<result_type> > f =
-            boost::make_shared<detail::when_some<result_type> >(
-                std::move(lazy_values), n);
-
+        boost::intrusive_ptr<frame_type> f(new frame_type(std::move(values), n));
         lcos::local::futures_factory<when_some_result<result_type>()> p(
-            util::bind(&detail::when_some<result_type>::operator(), f));
-
+            util::bind(&detail::when_some_frame<result_type>::operator(), f));
         p.apply();
+
         return p.get_future();
     }
 }}

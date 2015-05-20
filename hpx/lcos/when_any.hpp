@@ -135,7 +135,6 @@ namespace hpx
 #include <hpx/traits/acquire_future.hpp>
 
 #include <boost/atomic.hpp>
-#include <boost/enable_shared_from_this.hpp>
 #include <boost/fusion/include/for_each.hpp>
 #include <boost/fusion/include/is_sequence.hpp>
 #include <boost/utility/swap.hpp>
@@ -204,12 +203,12 @@ namespace hpx { namespace lcos
     {
         ///////////////////////////////////////////////////////////////////////
         template <typename Sequence>
-        struct when_any;
+        struct when_any_frame;
 
         template <typename Sequence>
         struct set_when_any_callback_impl
         {
-            explicit set_when_any_callback_impl(when_any<Sequence>& when)
+            explicit set_when_any_callback_impl(when_any_frame<Sequence>& when)
               : when_(when), idx_(0)
             {}
 
@@ -226,11 +225,12 @@ namespace hpx { namespace lcos
                             typename lcos::detail::shared_state_ptr_for<Future>::type
                             shared_state_ptr;
 
+                        boost::intrusive_ptr<when_any_frame<Sequence> > that_(&when_);
                         shared_state_ptr const& shared_state =
                             lcos::detail::get_shared_state(future);
                         shared_state->execute_deferred();
                         shared_state->set_on_completed(util::bind(
-                            &when_any<Sequence>::on_future_ready, when_.shared_from_this(),
+                            &when_any_frame<Sequence>::on_future_ready, std::move(that_),
                             idx_, threads::get_self_id()));
                     }
                     else {
@@ -257,22 +257,38 @@ namespace hpx { namespace lcos
                 std::for_each(sequence.begin(), sequence.end(), *this);
             }
 
-            when_any<Sequence>& when_;
+            when_any_frame<Sequence>& when_;
             mutable std::size_t idx_;
         };
 
         template <typename Sequence>
-        void set_on_completed_callback(when_any<Sequence>& when)
+        void set_on_completed_callback(when_any_frame<Sequence>& when)
         {
             set_when_any_callback_impl<Sequence> callback(when);
-            callback.apply(when.lazy_values_.futures);
+            callback.apply(when.t_.futures);
         }
 
         ///////////////////////////////////////////////////////////////////////
         template <typename Sequence>
-        struct when_any : boost::enable_shared_from_this<when_any<Sequence> > //-V690
+        struct when_any_frame //-V690
+          : hpx::lcos::detail::future_data<when_any_result<Sequence> >
         {
+            typedef when_any_result<Sequence> result_type;
+            typedef hpx::lcos::future<result_type> type;
+
+        private:
+            // workaround gcc regression wrongly instantiating constructors
+            when_any_frame();
+            when_any_frame(when_any_frame const&);
+
         public:
+            template <typename Tuple_>
+            when_any_frame(Tuple_ && t)
+              : t_(std::forward<Tuple_>(t))
+              , index_(when_any_result<Sequence>::index_error())
+              , goal_reached_on_calling_thread_(false)
+            {}
+
             void on_future_ready(std::size_t idx, threads::thread_id_type const& id)
             {
                 std::size_t index_not_initialized =
@@ -287,21 +303,6 @@ namespace hpx { namespace lcos
                 }
             }
 
-        private:
-            // workaround gcc regression wrongly instantiating constructors
-            when_any();
-            when_any(when_any const&);
-
-        public:
-            typedef Sequence argument_type;
-            typedef when_any_result<Sequence> result_type;
-
-            when_any(argument_type && lazy_values)
-              : lazy_values_(std::move(lazy_values))
-              , index_(when_any_result<Sequence>::index_error())
-              , goal_reached_on_calling_thread_(false)
-            {}
-
             result_type operator()()
             {
                 // set callback functions to executed when future is ready
@@ -314,17 +315,17 @@ namespace hpx { namespace lcos
                 {
                     // wait for any of the futures to return to become ready
                     this_thread::suspend(threads::suspended,
-                        "hpx::lcos::detail::when_any::operator()");
+                        "hpx::lcos::detail::when_any_frame::operator()");
                 }
 
                 // that should not happen
                 HPX_ASSERT(index_.load() != when_any_result<Sequence>::index_error());
 
-                lazy_values_.index = index_.load();
-                return std::move(lazy_values_);
+                t_.index = index_.load();
+                return std::move(t_);
             }
 
-            result_type lazy_values_;
+            result_type t_;
             boost::atomic<std::size_t> index_;
             bool goal_reached_on_calling_thread_;
         };
@@ -333,35 +334,33 @@ namespace hpx { namespace lcos
     ///////////////////////////////////////////////////////////////////////////
     template <typename Future>
     lcos::future<when_any_result<std::vector<Future> > >
-    when_any(std::vector<Future>& lazy_values)
+    when_any(std::vector<Future>& values)
     {
         BOOST_STATIC_ASSERT_MSG(
             traits::is_future<Future>::value, "invalid use of when_any");
 
         typedef std::vector<Future> result_type;
+        typedef detail::when_any_frame<result_type> frame_type;
 
-        result_type lazy_values_;
-        lazy_values_.reserve(lazy_values.size());
-        std::transform(lazy_values.begin(), lazy_values.end(),
-            std::back_inserter(lazy_values_),
+        result_type values_;
+        values_.reserve(values.size());
+        std::transform(values.begin(), values.end(),
+            std::back_inserter(values_),
             traits::acquire_future_disp());
 
-        boost::shared_ptr<detail::when_any<result_type> > f =
-            boost::make_shared<detail::when_any<result_type> >(
-                std::move(lazy_values_));
-
+        boost::intrusive_ptr<frame_type> f(new frame_type(std::move(values_)));
         lcos::local::futures_factory<when_any_result<result_type>()> p(
-            util::bind(&detail::when_any<result_type>::operator(), f));
-
+            util::bind(&detail::when_any_frame<result_type>::operator(), f));
         p.apply();
+
         return p.get_future();
     }
 
     template <typename Future>
     lcos::future<when_any_result<std::vector<Future> > > //-V659
-    when_any(std::vector<Future> && lazy_values)
+    when_any(std::vector<Future> && t)
     {
-        return lcos::when_any(lazy_values);
+        return lcos::when_any(t);
     }
 
     template <typename Iterator>
@@ -375,11 +374,11 @@ namespace hpx { namespace lcos
             future_type;
         typedef std::vector<future_type> result_type;
 
-        result_type lazy_values_;
-        std::transform(begin, end, std::back_inserter(lazy_values_),
+        result_type values;
+        std::transform(begin, end, std::back_inserter(values),
             traits::acquire_future_disp());
 
-        return lcos::when_any(lazy_values_);
+        return lcos::when_any(values);
     }
 
     inline lcos::future<when_any_result<hpx::util::tuple<> > > //-V524
@@ -402,14 +401,14 @@ namespace hpx { namespace lcos
             future_type;
         typedef std::vector<future_type> result_type;
 
-        result_type lazy_values_;
-        lazy_values_.reserve(count);
+        result_type values;
+        values.reserve(count);
 
         traits::acquire_future_disp func;
         for (std::size_t i = 0; i != count; ++i)
-            lazy_values_.push_back(func(*begin++));
+            values.push_back(func(*begin++));
 
-        return lcos::when_any(lazy_values_);
+        return lcos::when_any(values);
     }
 
     ///////////////////////////////////////////////////////////////////////////
@@ -422,18 +421,16 @@ namespace hpx { namespace lcos
         typedef hpx::util::tuple<
                 typename traits::acquire_future<Ts>::type...
             > result_type;
+        typedef detail::when_any_frame<result_type> frame_type;
 
         traits::acquire_future_disp func;
-        result_type lazy_values(func(std::forward<Ts>(ts))...);
+        result_type values(func(std::forward<Ts>(ts))...);
 
-        boost::shared_ptr<detail::when_any<result_type> > f =
-            boost::make_shared<detail::when_any<result_type> >(
-                std::move(lazy_values));
-
+        boost::intrusive_ptr<frame_type> f(new frame_type(std::move(values)));
         lcos::local::futures_factory<when_any_result<result_type>()> p(
-            util::bind(&detail::when_any<result_type>::operator(), f));
-
+            util::bind(&detail::when_any_frame<result_type>::operator(), f));
         p.apply();
+
         return p.get_future();
     }
 }}
