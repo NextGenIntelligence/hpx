@@ -150,6 +150,7 @@ namespace hpx { namespace lcos
             void await(TupleIter&&, boost::mpl::true_)
             {
                 this->set_result(util::unused);
+                self_.reset();
             }
 
             // Current element is a range (vector) of futures
@@ -172,11 +173,9 @@ namespace hpx { namespace lcos
                         boost::intrusive_ptr<
                             lcos::detail::future_data<future_result_type>
                         > next_future_data = lcos::detail::get_shared_state(*next);
-
-                        boost::intrusive_ptr<when_each_frame> this_(this);
                         next_future_data->execute_deferred();
                         next_future_data->set_on_completed(util::bind(
-                            f, this_, std::move(iter),
+                            f, this, std::move(iter),
                             std::move(next), std::move(end)));
                         return;
                     }
@@ -234,11 +233,9 @@ namespace hpx { namespace lcos
                     boost::intrusive_ptr<
                         lcos::detail::future_data<future_result_type>
                     > next_future_data = lcos::detail::get_shared_state(fut);
-
-                    boost::intrusive_ptr<when_each_frame> this_(this);
                     next_future_data->execute_deferred();
                     next_future_data->set_on_completed(hpx::util::bind(
-                        f, this_, std::move(iter), true_(), false_()));
+                        f, this, std::move(iter), true_(), false_()));
 
                     return;
                 }
@@ -279,6 +276,7 @@ namespace hpx { namespace lcos
                     begin_type;
                 typedef boost::is_same<begin_type, end_type> pred;
 
+                self_.reset(this);
                 await(boost::fusion::begin(t_), pred());
             }
 
@@ -287,6 +285,7 @@ namespace hpx { namespace lcos
             F f_;
             std::size_t count_;
             std::size_t needed_count_;
+            boost::intrusive_ptr<when_each_frame> self_;
         };
     }
 

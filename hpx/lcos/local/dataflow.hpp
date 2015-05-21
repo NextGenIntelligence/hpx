@@ -155,6 +155,7 @@ namespace hpx { namespace lcos { namespace local
                 catch(...) {
                     this->set_exception(boost::current_exception());
                 }
+                self_.reset();
             }
 
             ///////////////////////////////////////////////////////////////////
@@ -174,9 +175,8 @@ namespace hpx { namespace lcos { namespace local
 
                 // schedule the final function invocation with high priority
                 execute_function_type f = &dataflow_frame::execute;
-                boost::intrusive_ptr<dataflow_frame> this_(this);
                 threads::register_thread_nullary(
-                    util::deferred_call(f, this_, is_void())
+                    util::deferred_call(f, this, is_void())
                   , "hpx::lcos::local::dataflow::execute"
                   , threads::pending
                   , true
@@ -193,8 +193,7 @@ namespace hpx { namespace lcos { namespace local
                     is_void;
 
                 execute_function_type f = &dataflow_frame::execute;
-                boost::intrusive_ptr<dataflow_frame> this_(this);
-                hpx::apply(sched, f, this_, is_void());
+                hpx::apply(sched, f, this, is_void());
             }
 
             ///////////////////////////////////////////////////////////////////
@@ -267,13 +266,11 @@ namespace hpx { namespace lcos { namespace local
                             lcos::detail::future_data<future_result_type>
                         > next_future_data
                             = lcos::detail::get_shared_state(*next);
-
-                        boost::intrusive_ptr<dataflow_frame> this_(this);
                         next_future_data->execute_deferred();
                         next_future_data->set_on_completed(
                             boost::bind(
                                 f
-                              , this_
+                              , this
                               , std::move(iter)
                               , std::move(next)
                               , std::move(end)
@@ -341,13 +338,11 @@ namespace hpx { namespace lcos { namespace local
                         lcos::detail::future_data<future_result_type>
                     > next_future_data
                         = lcos::detail::get_shared_state(f_);
-
-                    boost::intrusive_ptr<dataflow_frame> this_(this);
                     next_future_data->execute_deferred();
                     next_future_data->set_on_completed(
                         hpx::util::bind(
                             f
-                          , this_
+                          , this
                           , std::move(iter)
                           , boost::mpl::true_()
                           , boost::mpl::false_()
@@ -395,6 +390,7 @@ namespace hpx { namespace lcos { namespace local
                     typename boost::fusion::result_of::begin<Futures>::type
                     begin_type;
 
+                self_.reset(this);
                 await(
                     policy_
                   , boost::fusion::begin(futures_)
@@ -412,6 +408,7 @@ namespace hpx { namespace lcos { namespace local
             Func func_;
             Futures futures_;
             bool done_;
+            boost::intrusive_ptr<dataflow_frame> self_;
         };
     }
 
