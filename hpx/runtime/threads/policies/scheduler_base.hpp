@@ -121,27 +121,29 @@ namespace hpx { namespace threads { namespace policies
 #endif
 
 #ifdef HPX_HAVE_THREAD_STEALING_COUNTS
-        virtual boost::uint64_t get_num_pending_misses(std::size_t num_thread,
+        virtual boost::int64_t get_num_pending_misses(std::size_t num_thread,
             bool reset) = 0;
-        virtual boost::uint64_t get_num_pending_accesses(std::size_t num_thread,
+        virtual boost::int64_t get_num_pending_accesses(std::size_t num_thread,
             bool reset) = 0;
 
-        virtual boost::uint64_t get_num_stolen_from_pending(std::size_t num_thread,
+        virtual boost::int64_t get_num_stolen_from_pending(std::size_t num_thread,
             bool reset) = 0;
-        virtual boost::uint64_t get_num_stolen_to_pending(std::size_t num_thread,
+        virtual boost::int64_t get_num_stolen_to_pending(std::size_t num_thread,
             bool reset) = 0;
-        virtual boost::uint64_t get_num_stolen_from_staged(std::size_t num_thread,
+        virtual boost::int64_t get_num_stolen_from_staged(std::size_t num_thread,
             bool reset) = 0;
-        virtual boost::uint64_t get_num_stolen_to_staged(std::size_t num_thread,
+        virtual boost::int64_t get_num_stolen_to_staged(std::size_t num_thread,
             bool reset) = 0;
 #endif
 
         virtual boost::int64_t get_queue_length(
             std::size_t num_thread = std::size_t(-1)) const = 0;
 
-        virtual boost::int64_t get_thread_count(thread_state_enum state = unknown,
+        virtual boost::int64_t get_thread_count(
+            thread_state_enum state = unknown,
             thread_priority priority = thread_priority_default,
-            std::size_t num_thread = std::size_t(-1), bool reset = false) const = 0;
+            std::size_t num_thread = std::size_t(-1),
+            bool reset = false) const = 0;
 
         virtual void abort_all_suspended_threads() = 0;
 
@@ -177,6 +179,10 @@ namespace hpx { namespace threads { namespace policies
         virtual boost::int64_t get_average_task_wait_time(
             std::size_t num_thread = std::size_t(-1)) const = 0;
 #endif
+
+        virtual void start_periodic_maintenance(
+            boost::atomic<hpx::state>& global_state)
+        {}
 
     protected:
         topology const& topology_;
